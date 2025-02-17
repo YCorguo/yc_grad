@@ -96,6 +96,13 @@ from scipy.stats import ks_2samp
 # concurrent.futures 提供并发编程的工具，支持线程池和进程池，便于多任务并行执行
 import concurrent.futures
 
+import re
+import pandas as pd
+import numpy as np
+from collections import Counter
+from nltk.corpus import stopwords
+from nltk import pos_tag, word_tokenize
+
 # 忽略特定类型的警告
 warnings.filterwarnings("ignore", category=RuntimeWarning)  # 忽略运行时警告
 warnings.filterwarnings("ignore", category=UserWarning)  # 忽略用户警告
@@ -1466,3 +1473,86 @@ def save_workspace_variables(filename, variables):
     # 打开文件并使用 dill 库序列化保存工作区变量
     with open(filename, "wb") as file:
         dill.dump(workspace_variables, file)
+
+# 定义一个函数来计算文本特征
+def calculate_text_features(text):
+    # 如果文本为空或者不是字符串，返回默认值
+    if text is pd.NA or not text or not isinstance(text, str):
+        return {
+            'char_count': 0,
+            'word_count': 0,
+            'avg_word_length': 0.0,
+            'punctuation_count': 0,
+            'uppercase_count': 0,
+            'digit_count': 0,
+            'stopword_ratio': 0.0,
+            'noun_ratio': 0.0,
+            'verb_ratio': 0.0,
+            'unique_word_ratio': 0.0,
+            'avg_sentence_length': 0.0
+        }
+    
+    # 字符总数
+    char_count = len(text)
+    
+    # 单词总数
+    words = word_tokenize(text)
+    word_count = len(words)
+    
+    # 平均单词长度
+    avg_word_length = sum(len(word) for word in words) / word_count if word_count > 0 else 0.0
+    
+    # 标点符号总数
+    punctuation_count = len(re.findall(r'[^\w\s]', text))
+    
+    # 大写字母总数
+    uppercase_count = sum(1 for c in text if c.isupper())
+    
+    # 数字字符总数
+    digit_count = sum(1 for c in text if c.isdigit())
+    
+    # 停用词比例
+    stop_words = set(stopwords.words('english'))
+    stopword_count = sum(1 for word in words if word.lower() in stop_words)
+    stopword_ratio = stopword_count / word_count if word_count > 0 else 0.0
+    
+    # 词性标注及比例
+    pos_tags = pos_tag(words)
+    pos_counts = Counter(tag for word, tag in pos_tags)
+    total_pos_tags = sum(pos_counts.values())
+    noun_ratio = (pos_counts.get('NN', 0) + pos_counts.get('NNS', 0)) / total_pos_tags if total_pos_tags > 0 else 0.0
+    verb_ratio = (pos_counts.get('VB', 0) + pos_counts.get('VBD', 0)) / total_pos_tags if total_pos_tags > 0 else 0.0
+    
+    # 独特词汇比例
+    unique_words = set(words)
+    unique_word_ratio = len(unique_words) / word_count if word_count > 0 else 0.0
+    
+    # 平均句子长度
+    sentences = re.split(r'[.!?]+', text)
+    sentence_lengths = [len(word_tokenize(sentence)) for sentence in sentences if sentence.strip()]
+    avg_sentence_length = np.mean(sentence_lengths) if sentence_lengths else 0.0
+    
+    return {
+        'char_count': char_count,
+        'word_count': word_count,
+        'avg_word_length': avg_word_length,
+        'punctuation_count': punctuation_count,
+        'uppercase_count': uppercase_count,
+        'digit_count': digit_count,
+        'stopword_ratio': stopword_ratio,
+        'noun_ratio': noun_ratio,
+        'verb_ratio': verb_ratio,
+        'unique_word_ratio': unique_word_ratio,
+        'avg_sentence_length': avg_sentence_length
+    }
+
+def add_text_numeric_feat(smp_data):
+    # 对每一列应用calculate_text_features函数，并收集特征
+    for col in ['title', 'user_description', 'all_tags']:
+        print(f"Processing {col}...")
+        features = smp_data[col].apply(calculate_text_features)
+        features_df = pd.DataFrame(features.tolist())
+        # 在特征名之前加上列名作为前缀
+        features_df.columns = [f"{col}_{name}" for name in features_df.columns]
+        smp_data = pd.concat([smp_data, features_df], axis=1)
+    return smp_data

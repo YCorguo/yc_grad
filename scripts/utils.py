@@ -130,6 +130,7 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 import numpy as np
 
+from scipy.stats import spearmanr
 
 
 # 忽略特定类型的警告
@@ -1585,3 +1586,342 @@ def add_text_numeric_feat(smp_data):
         features_df.columns = [f"{col}_{name}" for name in features_df.columns]
         smp_data = pd.concat([smp_data, features_df], axis=1)
     return smp_data
+
+# 🔹 通道注意力 SEBlock
+class SEBlock(nn.Module):
+    def __init__(self, input_dim, reduction=8):
+        super(SEBlock, self).__init__()
+        reduced_dim = max(1, input_dim // reduction)
+        self.fc1 = nn.Linear(input_dim, reduced_dim)
+        self.fc2 = nn.Linear(reduced_dim, input_dim)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        attn = x.mean(dim=0, keepdim=True)  # 对 batch 进行全局池化
+        attn = self.fc1(attn)
+        attn = nn.ReLU()(attn)
+        attn = self.fc2(attn)
+        attn = self.sigmoid(attn)  # 计算通道注意力
+        return x * attn  # 重新加权拼接后的 embedding
+
+# 🔹 Transformer 编码器
+class TransformerEncoderBlock(nn.Module):
+    def __init__(self, input_dim, num_heads, hidden_dim, dropout=0.1):
+        super(TransformerEncoderBlock, self).__init__()
+        self.self_attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, dropout=dropout)
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(hidden_dim, input_dim)
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+        self.dropout2 = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        residual = x
+        x = self.self_attn(x, x, x)[0]
+        x = self.dropout1(x)
+        x = self.norm1(x + residual)
+        
+        residual = x
+        x = self.linear1(x)
+        x = torch.relu(x)
+        x = self.dropout2(self.linear2(x))
+        x = self.norm2(x + residual)
+        return x
+
+# 🔹 MLP
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim):
+        super(MLP, self).__init__()
+        layers = []
+        current_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            current_dim = hidden_dim
+        layers.append(nn.Linear(current_dim, output_dim))
+        self.mlp = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.mlp(x)
+
+# 🔹 Transformer + MLP
+class TransformerMLPModel(nn.Module):
+    def __init__(self, input_dim=216, num_heads=3, transformer_hidden_dim=512, 
+                 mlp_hidden_dims=[128, 64, 32, 8], output_dim=1, dropout=0.1):
+        super(TransformerMLPModel, self).__init__()
+        num_heads = 10
+        while input_dim % num_heads:
+            num_heads -= 1
+
+        self.se_block = SEBlock(input_dim)  # 通道注意力模块
+        self.transformer = TransformerEncoderBlock(input_dim, num_heads, transformer_hidden_dim, dropout)
+        self.mlp = MLP(input_dim, mlp_hidden_dims, output_dim)  # 最终预测
+
+    def forward(self, x):
+        x = self.se_block(x)  # 先调整 A+B 特征的权重
+        x = x.unsqueeze(0)  # Transformer 输入要求 (seq_len, batch_size, input_dim)
+        x = self.transformer(x)
+        x = x.squeeze(0)  # 变回 (batch_size, input_dim)
+        return self.mlp(x)
+
+# 🔹 AllinOneMLP（最终版本）
+class AllinOneMLP(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(AllinOneMLP, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModel(input_dim=total_dims)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+# 消融实验
+
+# 1. 去掉dropout
+# 2. 去掉残差连接
+# 3. 去掉transformermlp
+# 4. 去掉transformer
+# 5. 去掉mlp（保留transformer+一个fc）
+# 6. 去掉SEBlock
+
+# 🔹 Transformer + MLP
+class TransformerMLPModelAblation(nn.Module):
+    def __init__(self, input_dim=216, num_heads=3, transformer_hidden_dim=512, 
+                 mlp_hidden_dims=[128, 64, 32, 8], output_dim=1, dropout=0.1,
+                 need_se_block=True, need_transformer=True, need_mlp=True):
+        super(TransformerMLPModelAblation, self).__init__()
+        num_heads = 10
+        while input_dim % num_heads:
+            num_heads -= 1
+
+        self.se_block = SEBlock(input_dim)  # 通道注意力模块
+        self.transformer = TransformerEncoderBlock(input_dim, num_heads, transformer_hidden_dim, dropout)
+        self.need_se_block = need_se_block
+        self.need_transformer = need_transformer
+        self.need_mlp = need_mlp
+        if self.need_mlp:
+            self.mlp = MLP(input_dim, mlp_hidden_dims, output_dim)  # 最终预测
+        else:
+            self.mlp = nn.Linear(input_dim, output_dim)  # 最终预测
+        self.need_se_block = need_se_block
+        self.need_transformer = need_transformer
+        self.need_mlp = need_mlp
+
+    def forward(self, x):
+        if self.need_se_block:
+            x = self.se_block(x)  # 先调整 A+B 特征的权重
+        if self.need_transformer:
+            x = x.unsqueeze(0)  # Transformer 输入要求 (seq_len, batch_size, input_dim)
+            x = self.transformer(x)
+            x = x.squeeze(0)  # 变回 (batch_size, input_dim)
+        return self.mlp(x)
+
+class WithoutDropout(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0):
+        super(WithoutDropout, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModel(input_dim=total_dims, dropout=dropout_rate)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+class WithoutResidual(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(WithoutResidual, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModel(input_dim=total_dims)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) # + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+class WithoutTransformerMLP(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(WithoutTransformerMLP, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModel(input_dim=total_dims)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.residual(x)
+
+class WithoutTransformer(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(WithoutTransformer, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModelAblation(input_dim=total_dims, need_transformer=False)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+class WithoutMLP(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(WithoutMLP, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModelAblation(input_dim=total_dims, need_mlp=False)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+class WithoutSEBlock(nn.Module):
+    def __init__(self, image_dim, text_dim, user_dim, mask, dropout_rate=0.2):
+        super(WithoutSEBlock, self).__init__()
+
+        self.mask = mask
+        dims = [image_dim, text_dim, user_dim]
+        total_dims = sum([dims[i] for i in range(len(dims)) if mask >> i & 1])
+        
+        self.trans_mlp = TransformerMLPModelAblation(input_dim=total_dims, need_se_block=False)
+        self.residual = nn.Linear(total_dims, 1)  # 残差连接，确保 B 影响力不变
+        self.dropout = nn.Dropout(p=dropout_rate)  # Feature Dropout
+
+    def forward(self, x):
+        x = self.dropout(x)  # Dropout 让模型不依赖 A
+        return self.trans_mlp(x) + self.residual(x)  # 残差连接，确保 B 信息不会丢失
+
+def train_and_evaluate(
+    model_class, image_dim, text_dim, user_dim, train_loader, test_loader,
+    device, save_file_prefix, model_name, masks, X_test_tensor, y_test_tensor, 
+    ckpt_gap, num_epochs=500, lr=1e-4, weight_decay=5e-4, stop_threshold=100, 
+    clip_and_norm=False, min_eps=0.000001, 
+):
+    criterion = nn.MSELoss()
+    shap_df_final = None
+    results = []
+    
+    for mask in masks:
+        def get_input(input_data, mask):
+            res = []
+            if mask >> 0 & 1:
+                res.append(input_data[:, :image_dim])
+            if mask >> 1 & 1:
+                res.append(input_data[:, image_dim:image_dim+text_dim])
+            if mask >> 2 & 1:
+                res.append(input_data[:, image_dim+text_dim:])
+            return torch.cat(res, dim=1)
+        
+        model = model_class(image_dim, text_dim, user_dim, mask).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        print("mask: ", mask)
+
+        epoch_losses = []
+        test_losses = []
+        min_train_loss = float('inf')
+        min_test_loss = float('inf')
+        last_refresh_train = 0
+        last_refresh_test = 0
+
+        progress_bar = tqdm.tqdm(range(num_epochs), desc=f"Training model {model_name}")
+        for epoch in progress_bar:
+            model.train()
+            running_loss = 0.0
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(get_input(inputs, mask))
+                loss = criterion(outputs, labels)
+                loss.backward()
+                if clip_and_norm:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                optimizer.step()
+                running_loss += loss.item()
+            
+            epoch_losses.append(running_loss / len(train_loader))
+            
+            model.eval()
+            with torch.no_grad():
+                total_loss = 0.0
+                for inputs, labels in test_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(get_input(inputs, mask))
+                    loss = criterion(outputs, labels)
+                    total_loss += loss.item()
+                test_losses.append(total_loss / len(test_loader))
+            
+            if epoch_losses[-1] < min_train_loss:
+                min_train_loss = epoch_losses[-1]
+                last_refresh_train = epoch
+                torch.save(model.state_dict(), f'{model_name}_training_{save_file_prefix}_mask_{mask}.pt')
+            if test_losses[-1] < min_test_loss:
+                min_test_loss = test_losses[-1]
+                last_refresh_test = epoch
+                torch.save(model.state_dict(), f'{model_name}_testing_{save_file_prefix}_mask_{mask}.pt')
+            if (epoch+1) % ckpt_gap == 0:
+                torch.save(model.state_dict(), f'{model_name}_ckpt_{epoch}_{save_file_prefix}_mask_{mask}.pt')
+            
+            progress_bar.set_postfix(train_loss=f"{epoch_losses[-1]:.4f}", test_loss=f"{test_losses[-1]:.4f}")
+        
+        model.load_state_dict(torch.load(f'{model_name}_testing_{save_file_prefix}_mask_{mask}.pt'))
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, epoch + 2), epoch_losses, color='b', label=f'Training Loss as {model_name}')
+        plt.plot(range(1, epoch + 2), test_losses, color='r', label=f'Testing Loss as {model_name}')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Epoch vs Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        
+        output_y_labels = y_test_tensor.clone()
+        output_y_preds = model(get_input(X_test_tensor, mask))
+        
+        correlation, _ = spearmanr(output_y_labels.cpu().detach().numpy().flatten(), output_y_preds.cpu().detach().numpy().flatten())
+        mae = torch.mean(torch.abs(output_y_labels - output_y_preds)).item()
+        
+        print(f'Correlation between actual labels and predicted values at {model_name}: {correlation}')
+        print(f'Mean Absolute Error (MAE) at {model_name}: {mae}')
+
+        results.append([epoch_losses, test_losses])
+
+    return results
+
+def get_input(input_data, mask):
+    res = []
+    if mask >> 0 & 1:
+        res.append(input_data[:, :image_dim])
+    if mask >> 1 & 1:
+        res.append(input_data[:, image_dim:image_dim+text_dim])
+    if mask >> 2 & 1:
+        res.append(input_data[:, image_dim+text_dim:])
+    return torch.cat(res, dim=1)
